@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -49,19 +50,8 @@ const (
 )
 
 var (
-	grayscale = func(code int) func(string) string {
-		if color.NoColor {
-			return func(s string) string { return s }
-		}
-		return func(s string) string {
-			return fmt.Sprintf("\x1b[;38;5;%dm%s\x1b[0m", code+232, s)
-		}
-	}
-
 	// number of redirects followed
 	redirectsFollowed int
-
-	usage = fmt.Sprintf("usage: %s URL", os.Args[0])
 
 	version = "devel" // for -v flag, updated during the release process with -ldflags=-X=main.version=...
 
@@ -70,6 +60,7 @@ var (
 
 type binArgs struct {
 	PostBody        string  `short:"d" long:"data" description:"the body of a POST or PUT request"`
+	ClientCertFile  string  `short:"E" long:"cert" description:"client certificate for TLS config"`
 	HTTPHeaders     headers `short:"H" long:"header" description:"HTTP Header(s) to set. Can be used multiple times -H 'Accept:...' -H 'Range...'"`
 	OnlyHeader      bool    `short:"I" long:"head" description:"don't read the body of the request"`
 	Insecure        bool    `short:"k" long:"insecure" description:"allow insecure TLS connections"`
@@ -129,10 +120,11 @@ func (a *binArgs) parse(args []string) (string, error) {
 const maxRedirects = 10
 
 func printf(format string, a ...interface{}) (n int, err error) {
-	if color.Output == os.Stdout {
-		return fmt.Printf(format, a...)
-	}
 	return fmt.Fprintf(color.Output, format, a...)
+}
+
+func grayscale(code color.Attribute) func(string, ...interface{}) string {
+	return color.New(code + 232).SprintfFunc()
 }
 
 func main() {
@@ -156,7 +148,51 @@ func main() {
 		log.Fatal("must supply post body using -d when POST or PUT is used")
 	}
 
+	if args.OnlyHeader {
+		args.HTTPMethod = "HEAD"
+	}
+
 	visit(args.URL)
+
+}
+
+// readClientCert - helper function to read client certificate
+// from pem formatted file
+func readClientCert(filename string) []tls.Certificate {
+	if filename == "" {
+		return nil
+	}
+	var (
+		pkeyPem []byte
+		certPem []byte
+	)
+
+	// read client certificate file (must include client private key and certificate)
+	certFileBytes, err := ioutil.ReadFile(args.ClientCertFile)
+	if err != nil {
+		log.Fatalf("failed to read client certificate file: %v", err)
+	}
+
+	for {
+		block, rest := pem.Decode(certFileBytes)
+		if block == nil {
+			break
+		}
+		certFileBytes = rest
+
+		if strings.HasSuffix(block.Type, "PRIVATE KEY") {
+			pkeyPem = pem.EncodeToMemory(block)
+		}
+		if strings.HasSuffix(block.Type, "CERTIFICATE") {
+			certPem = pem.EncodeToMemory(block)
+		}
+	}
+
+	cert, err := tls.X509KeyPair(certPem, pkeyPem)
+	if err != nil {
+		log.Fatalf("unable to load client cert and key pair: %v", err)
+	}
+	return []tls.Certificate{cert}
 }
 
 func parseURL(uri string) *url.URL {
@@ -186,94 +222,54 @@ func headerKeyValue(h string) (string, string) {
 	return strings.TrimRight(h[:i], " "), strings.TrimLeft(h[i:], " :")
 }
 
-func getHostPort(url *url.URL) (string, string, string) {
-	scheme := url.Scheme
-	URLHost := url.Host
-
-	// No hostname, just a port
-	if strings.HasPrefix(URLHost, ":") {
-		URLHost = "localhost" + URLHost
-	}
-
-	host, port, err := net.SplitHostPort(URLHost)
-	if err != nil {
-		host = URLHost
-	}
-
-	switch scheme {
-	case "https":
-		if port == "" {
-			port = "443"
-		}
-	case "http":
-		if port == "" {
-			port = "80"
-		}
-	default:
-		log.Fatalf("unsupported url scheme %q", scheme)
-	}
-
-	return scheme, host, port
-}
-
 // visit visits a url and times the interaction.
 // If the response is a 30x, visit follows the redirect.
 func visit(url *url.URL) {
-	scheme, host, _ := getHostPort(url)
-
-	host, _, err := net.SplitHostPort(url.Host)
-	if err != nil {
-		host = url.Host
-	}
+	req := newRequest(args.HTTPMethod, url, args.PostBody)
 
 	var t0, t1, t2, t3, t4 time.Time
 
 	trace := &httptrace.ClientTrace{
-		DNSStart: func(i httptrace.DNSStartInfo) { t0 = time.Now() },
-		DNSDone:  func(i httptrace.DNSDoneInfo) { t1 = time.Now() },
+		DNSStart: func(_ httptrace.DNSStartInfo) { t0 = time.Now() },
+		DNSDone:  func(_ httptrace.DNSDoneInfo) { t1 = time.Now() },
+		ConnectStart: func(_, _ string) {
+			if t1.IsZero() {
+				// connecting to IP
+				t1 = time.Now()
+			}
+		},
 		ConnectDone: func(net, addr string, err error) {
 			if err != nil {
-				log.Fatalf("unable to connect to host %v %v", addr, err)
+				log.Fatalf("unable to connect to host %v: %v", addr, err)
 			}
 			t2 = time.Now()
 
 			printf("\n%s%s\n", color.GreenString("Connected to "), color.CyanString(addr))
 		},
-		WroteRequest:         func(i httptrace.WroteRequestInfo) { t3 = time.Now() },
+		GotConn:              func(_ httptrace.GotConnInfo) { t3 = time.Now() },
 		GotFirstResponseByte: func() { t4 = time.Now() },
 	}
-
-	if args.OnlyHeader {
-		args.HTTPMethod = "HEAD"
-	}
-
-	req, err := http.NewRequest(args.HTTPMethod, url.String(), createBody(args.PostBody))
-	if err != nil {
-		log.Fatalf("unable to create request: %v", err)
-	}
-	for _, h := range args.HTTPHeaders {
-		k, v := headerKeyValue(h)
-		if strings.EqualFold(k, "host") {
-			req.Host = v
-			continue
-		}
-		req.Header.Add(k, v)
-	}
-
 	req = req.WithContext(httptrace.WithClientTrace(context.Background(), trace))
 
-	proxyURL, err := http.ProxyFromEnvironment(req)
-	if err != nil {
-		log.Fatalf("error retrieving proxy from environment: %v", err)
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
-	tr := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-	}
-	if scheme == "https" {
+	switch url.Scheme {
+	case "https":
+		host, _, err := net.SplitHostPort(req.Host)
+		if err != nil {
+			host = req.Host
+		}
+
 		tr.TLSClientConfig = &tls.Config{
 			ServerName:         host,
 			InsecureSkipVerify: args.Insecure,
+			Certificates:       readClientCert(args.ClientCertFile),
 		}
 
 		// Because we create a custom TLSClientConfig, we have to opt-in to HTTP/2.
@@ -287,25 +283,25 @@ func visit(url *url.URL) {
 	client := &http.Client{
 		Transport: tr,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if !args.FollowRedirects {
-				return http.ErrUseLastResponse
-			}
-			if len(via) >= maxRedirects {
-				return fmt.Errorf("stopped after %d redirects", maxRedirects)
-			}
-			return nil
+			// always refuse to follow redirects, visit does that
+			// manually if required.
+			return http.ErrUseLastResponse
 		},
 	}
 
 	resp, err := client.Do(req)
-
 	if err != nil {
 		log.Fatalf("failed to read response: %v", err)
 	}
 
 	bodyMsg := readResponseBody(req, resp)
+	resp.Body.Close()
 
 	t5 := time.Now() // after read body
+	if t0.IsZero() {
+		// we skipped DNS
+		t0 = t1
+	}
 
 	// print status line and headers
 	printf("\n%s%s%s\n", color.GreenString("HTTP"), grayscale(14)("/"), color.CyanString("%d.%d %s", resp.ProtoMajor, resp.ProtoMinor, resp.Status))
@@ -339,7 +335,7 @@ func visit(url *url.URL) {
 
 	fmt.Println()
 
-	switch scheme {
+	switch url.Scheme {
 	case "https":
 		printf(colorize(HTTPSTemplate),
 			fmta(t1.Sub(t0)), // dns lookup
@@ -378,7 +374,7 @@ func visit(url *url.URL) {
 
 		redirectsFollowed++
 		if redirectsFollowed > maxRedirects {
-			log.Fatalf("maximum number of redirects (%d) followed\n", maxRedirects)
+			log.Fatalf("maximum number of redirects (%d) followed", maxRedirects)
 		}
 
 		visit(loc)
@@ -387,6 +383,22 @@ func visit(url *url.URL) {
 
 func isRedirect(resp *http.Response) bool {
 	return resp.StatusCode > 299 && resp.StatusCode < 400
+}
+
+func newRequest(method string, url *url.URL, body string) *http.Request {
+	req, err := http.NewRequest(method, url.String(), createBody(body))
+	if err != nil {
+		log.Fatalf("unable to create request: %v", err)
+	}
+	for _, h := range args.HTTPHeaders {
+		k, v := headerKeyValue(h)
+		if strings.EqualFold(k, "host") {
+			req.Host = v
+			continue
+		}
+		req.Header.Add(k, v)
+	}
+	return req
 }
 
 func createBody(body string) io.Reader {
@@ -452,7 +464,7 @@ func readResponseBody(req *http.Request, resp *http.Response) string {
 
 		f, err := os.Create(filename)
 		if err != nil {
-			log.Fatalf("unable to create file %s", filename)
+			log.Fatalf("unable to create file %s: %v", filename, err)
 		}
 		defer f.Close()
 		w = f
